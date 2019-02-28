@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 use Data::Dumper;
+use Text::Diff;
 use Carp::Clan qw/^SQL::Translator/;
 use SQL::Translator::Schema::Constants;
 use Sub::Quote qw(quote_sub);
@@ -39,6 +40,9 @@ has no_batch_alters => (
   is => 'rw',
 );
 has ignore_missing_methods => (
+  is => 'rw',
+);
+has report_missing_methods_data => (
   is => 'rw',
 );
 has producer_args => (
@@ -250,6 +254,8 @@ sub produce_diff_sql {
             $meth ? map {
                     map { $_ ? "$_" : () } $meth->( (ref $_ eq 'ARRAY' ? @$_ : $_), $self->producer_args );
                   } @{ $flattened_diffs{$_} }
+                  : $self->report_missing_methods_data
+                  ? $self->generate_diff_for_missing_method($producer_class, $_, @{ $flattened_diffs{$_} })
                   : $self->ignore_missing_methods
                   ? "-- $producer_class cant $_"
                   : die "$producer_class cant $_";
@@ -289,6 +295,8 @@ sub produce_diff_sql {
       my $meth = $producer_class->can('drop_table');
 
       push @diffs, $meth ? ( map { $meth->($_, $self->producer_args) } @tables_to_drop)
+                         : $self->report_missing_methods_data
+                         ? $self->generate_diff_for_missing_method($producer_class, "drop_table", @tables_to_drop)
                          : $self->ignore_missing_methods
                          ? "-- $producer_class cant drop_table"
                          : die "$producer_class cant drop_table";
@@ -314,6 +322,62 @@ sub produce_diff_sql {
     }
     return undef;
 
+}
+
+sub generate_diff_for_missing_method {
+  my ( $self, $producer_class, $meth, @diffs ) = @_;
+  my %table_seen;
+  my @out = ("-- $producer_class cant $meth");
+  for my $diff (@diffs) {
+    if ( ref $diff eq "ARRAY" ) {
+      if ( $meth eq "alter_field" ) {
+        my $table = $diff->[0]->table->name;
+        push @out, "--     $table" if !$table_seen{$table}++;
+        my $old   = { %{ $diff->[0] } };
+        my $new   = { %{ $diff->[1] } };
+        for my $attrib (qw( table sql_data_type _numeric_sql_data_types order )) {
+          delete $_->{$attrib} for $old, $new;
+        }
+        $_->{size} = (ref $_->{size} eq "ARRAY") ? (join ":", @{$_->{size}}) : $_->{size} for grep exists $_->{size}, $old, $new;
+        local $Data::Dumper::Indent    = 1;
+        local $Data::Dumper::Purity    = 0;
+        local $Data::Dumper::Terse     = 1;
+        local $Data::Dumper::Deepcopy  = 1;
+        local $Data::Dumper::Quotekeys = 0;
+        local $Data::Dumper::Useperl   = 1;
+        local $Data::Dumper::Sortkeys  = 1;
+        my ( $got, $expected ) = map [ split /^/, Data::Dumper::Dumper($_) ], $old, $new;
+        push @out, "--         $old->{name}";
+        my $diff = diff $got, $expected, { CONTEXT => 0, STYLE => "Table" };
+        $diff =~ s/^[\+\-]+(\n|$)//mg; # remove spacer lines inbetween differences
+        push @out, map "--             $_", split /\n/, $diff;
+      }
+      else {
+        die "unknown method: $meth";
+      }
+    }
+    else {
+      if ( $meth eq "alter_drop_constraint" ) {
+        push @out, "--     ".$diff->table if !$table_seen{$diff->table->name}++;
+        push @out, "--         " . ( $diff->name || "<undef>" ) . " " . join ",", $diff->field_names;
+      }
+      elsif ( $meth eq "drop_field" ) {
+        push @out, "--     ".$diff->table if !$table_seen{$diff->table->name}++;
+        push @out, "--         " . ( $diff->name || "<undef>" );
+      }
+      elsif ( $meth eq "drop_table" ) {
+        push @out, "--     " . ( $diff->name || "<undef>" );
+      }
+      elsif ( $meth eq "alter_create_constraint" ) {
+        push @out, "--     ".$diff->table if !$table_seen{$diff->table->name}++;
+        push @out, "--         " . ( $diff->name || "<undef>" ) . " " . join ",", $diff->field_names;
+      }
+      else {
+        die "unknown method: $meth";
+      }
+    }
+  }
+  return join "\n", @out;
 }
 
 sub diff_table_indexes {
@@ -519,6 +583,11 @@ supports the ability to do all alters for a table as one statement.
 
 If the diff would need a method that is missing from the producer, just emit a
 comment showing the method is missing, rather than dieing with an error
+
+=item B<report_missing_methods_data>
+
+If the diff would need a method that is missing from the producer,
+emit a comment including hash diffs of the relevant data.
 
 =item B<producer_args>
 

@@ -47,7 +47,8 @@ sub _build_sizeless_types {
 sub field {
    my ($self, $field) = @_;
 
-   return join ' ', $self->field_name($field), ($self->field_type($field)||die 'type is required'),
+   return join ' ', $self->field_name($field),
+      ($self->field_type($field)||die 'type is required for '.$self->field_name($field).' in table '.$field->table),
       $self->field_autoinc($field),
       $self->field_nullable($field),
       $self->field_default($field),
